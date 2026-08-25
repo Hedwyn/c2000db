@@ -17,9 +17,10 @@ import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
+from dataclasses import Field, dataclass, fields
 from io import BufferedReader
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, Self, get_type_hints
 
 from .ccxml import build_ccxml, load_ccxml_config
 
@@ -33,13 +34,13 @@ type LineParser = Callable[[str], None]
 
 class CommandParser(Protocol):
     """
-    Called with (a) whatever followed the command name on its "dbg> <cmd> ..." line
-    (empty string if nothing did) and (b) an iterator over that command's output
-    lines (no trailing newlines, the "dbg> <cmd>" line itself excluded). A parser
-    raising is caught and reported, not propagated.
+    Called with (a) the `Command` parsed from whatever followed the command name on
+    its "dbg> <cmd> ..." line and (b) an iterator over that command's output lines
+    (no trailing newlines, the "dbg> <cmd>" line itself excluded). A parser raising
+    is caught and reported, not propagated.
     """
 
-    def __call__(self, args: str, lines: Iterable[str]) -> None: ...
+    def __call__(self, command: Command, lines: Iterable[str]) -> None: ...
 
 
 # The REPL echoes every command it runs as its own "dbg> <cmd>" line - must match
@@ -49,10 +50,103 @@ _PROMPT_PREFIX = "dbg> "
 # Must match repl.js's END_OF_COMMAND_MARKER.
 _END_OF_COMMAND_MARKER = "##--dbg-end--##"
 
-# repl.js commands that call printLocation() after moving the target - i.e. ones
-# whose output should trigger automatic source-line rendering.
-LOCATION_COMMANDS = frozenset(
-    {
+
+class Command(Protocol):
+    """
+    Structural base for the per-REPL-command dataclasses below. Each concrete
+    subclass is a frozen dataclass that lists every name the debugger accepts for
+    it in `aliases`; `parse` (defined once here, generically, for every subclass)
+    turns whatever followed the command name on its "dbg> <cmd> ..." line into a
+    typed instance. `COMMAND_ALIASES` - built from every subclass's `aliases` - is
+    the single source of truth for resolving a REPL command name, and is what gets
+    hooked into `command_parsers` (see `_pump_and_parse_stdout`) instead of
+    duplicating alias lists there.
+    """
+
+    # Mirrors typeshed's `_typeshed.DataclassInstance` protocol (down to the `Any`,
+    # which is `dataclasses.Field`'s own type parameter) - declaring the attribute
+    # it structurally requires is what lets `fields(cls)` below typecheck without a
+    # `# type: ignore`, since every concrete `Command` subclass is a dataclass.
+    __dataclass_fields__: ClassVar[dict[str, Field[Any]]]
+
+    aliases: ClassVar[tuple[str, ...]] = ()
+    # Whether this command's output should trigger automatic source-line
+    # rendering (repl.js commands that call printLocation() after moving the
+    # target, e.g. `step`/`continue` - see `LocationCommand`).
+    show_source: ClassVar[bool] = False
+
+    @classmethod
+    def parse(cls, args: str) -> Self:
+        """
+        Fills this dataclass's fields, in declaration order, from whitespace-
+        separated tokens in `args`, casting each to its field's declared type - a
+        `str` field always consumes the rest of the line (so e.g. `MemCommand`'s
+        one field gets the full "<addr> <count>" text), anything else consumes one
+        token. A field with nothing left to consume keeps its declared default,
+        which is what lets any/every argument be omitted.
+        """
+        command_fields = fields(cls)
+        field_types = get_type_hints(cls)
+        remaining = args.strip()
+        kwargs: dict[str, object] = {}
+        for field in command_fields:
+            if not field.init or not remaining:
+                break
+            field_type = field_types[field.name]
+            if field_type is str:
+                kwargs[field.name] = remaining
+                remaining = ""
+            elif field_type is int:
+                token, _, remaining = remaining.partition(" ")
+                kwargs[field.name] = int(token)
+                remaining = remaining.strip()
+            else:
+                raise TypeError(
+                    f"{cls.__name__}.{field.name}: Command.parse has no generic support "
+                    f"for {field_type!r}",
+                )
+        return cls(**kwargs)
+
+
+@dataclass(frozen=True)
+class UnknownCommand(Command):
+    """Fallback for a REPL command with no registered `Command` subclass."""
+
+    raw_args: str = ""
+
+
+@dataclass(frozen=True)
+class BacktraceCommand(Command):
+    aliases: ClassVar[tuple[str, ...]] = ("bt",)
+
+
+@dataclass(frozen=True)
+class FrameCommand(Command):
+    aliases: ClassVar[tuple[str, ...]] = ("frame", "f")
+
+    frame_index: int = 0
+
+
+@dataclass(frozen=True)
+class MemCommand(Command):
+    aliases: ClassVar[tuple[str, ...]] = ("mem",)
+
+    raw_args: str = ""
+
+
+@dataclass(frozen=True)
+class PrintCommand(Command):
+    aliases: ClassVar[tuple[str, ...]] = ("print", "p")
+
+
+@dataclass(frozen=True)
+class LocationCommand(Command):
+    """
+    repl.js commands that call printLocation() after moving the target - i.e. ones
+    whose output should trigger automatic source-line rendering.
+    """
+
+    aliases: ClassVar[tuple[str, ...]] = (
         "halt",
         "run",
         "go",
@@ -67,15 +161,36 @@ LOCATION_COMMANDS = frozenset(
         "stepi",
         "si",
         "nexti",
-    },
+    )
+    show_source: ClassVar[bool] = True
+
+
+COMMANDS: tuple[type[Command], ...] = (
+    BacktraceCommand,
+    FrameCommand,
+    MemCommand,
+    PrintCommand,
+    LocationCommand,
 )
 
 
-def is_location_command(name: str) -> bool:
-    """
-    Whether command `name` has incidence on where we are in the source code.
-    """
-    return name in LOCATION_COMMANDS
+def _build_alias_map(commands: Iterable[type[Command]]) -> dict[str, type[Command]]:
+    alias_map: dict[str, type[Command]] = {}
+    for command_cls in commands:
+        for alias in command_cls.aliases:
+            if alias in alias_map:
+                other = alias_map[alias]
+                raise ValueError(
+                    f"alias {alias!r} claimed by both {other.__name__} and {command_cls.__name__}",
+                )
+            alias_map[alias] = command_cls
+    return alias_map
+
+
+# Every alias of every registered `Command`, mapping to its dedicated class - the
+# single source of truth `_pump_and_parse_stdout` uses to resolve a REPL command
+# name into the class it should be parsed as (and then looked up in `command_parsers`).
+COMMAND_ALIASES: Mapping[str, type[Command]] = _build_alias_map(COMMANDS)
 
 
 DSS_BASENAME = "dss"
@@ -282,17 +397,23 @@ def gather_command_output(lines: Iterator[str]) -> Generator[str]:
         yield line
 
 
-def _echo_command_output(args: str, lines: Iterable[str]) -> None:
+def _echo_command_output(command: Command, lines: Iterable[str]) -> None:
     """Default `CommandParser`: just prints each line, for commands with no registered parser."""
-    _ = args
+    _ = command
     for line in lines:
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
 
 
-def _run_command_parser(parser: CommandParser, args: str, lines: Iterator[str]) -> None:
+def _run_command_parser(
+    parser: CommandParser,
+    command_cls: type[Command],
+    args: str,
+    lines: Iterator[str],
+) -> None:
     try:
-        parser(args, lines)
+        command = command_cls.parse(args)
+        parser(command, lines)
     except Exception as exc:  # noqa: BLE001 - a broken parser must not kill the REPL
         print(f"[c2000db] command parser {parser!r} raised: {exc!r}", file=sys.stderr)  # noqa: T201
     finally:
@@ -306,15 +427,18 @@ def _run_command_parser(parser: CommandParser, args: str, lines: Iterator[str]) 
 def _pump_and_parse_stdout(
     stdout: BufferedReader,
     line_parsers: Sequence[LineParser],
-    command_parsers: Mapping[str, CommandParser],
+    command_parsers: Mapping[type[Command], CommandParser],
 ) -> None:
     """
     Echoes `stdout` to this process's stdout as it arrives, while additionally:
       * calling every parser in `line_parsers` on each complete line the child printed.
-      * for a command whose name is a key in `command_parsers`, handing that
-        command's output lines to the matching parser instead of printing them raw -
-        the "dbg> <cmd>" line itself is still echoed live, only the result lines are
-        replaced by whatever the parser renders.
+      * for a command whose class (resolved via `COMMAND_ALIASES`) is a key in
+        `command_parsers`, handing that command's output lines to the matching
+        parser instead of printing them raw - the "dbg> <cmd>" line itself is still
+        echoed live, only the result lines are replaced by whatever the parser
+        renders. The raw text that followed the command name is parsed into that
+        class via `Command.parse` before the parser sees it, so a parser only ever
+        deals with typed, defaulted fields - never a raw argument string.
 
     `stdin` is left untouched by the caller, so a REPL child stays fully interactive
     while its stdout is being observed.
@@ -325,8 +449,9 @@ def _pump_and_parse_stdout(
         sys.stdout.flush()
         if line.startswith(_PROMPT_PREFIX):
             command_name, _, args = line.removeprefix(_PROMPT_PREFIX).partition(" ")
-            parser = command_parsers.get(command_name, _echo_command_output)
-            _run_command_parser(parser, args, gather_command_output(lines))
+            command_cls = COMMAND_ALIASES.get(command_name, UnknownCommand)
+            parser = command_parsers.get(command_cls, _echo_command_output)
+            _run_command_parser(parser, command_cls, args, gather_command_output(lines))
 
 
 def run_reset(dss_location: Path | None = None, ccxml_path: Path | None = None) -> int:
@@ -341,7 +466,7 @@ def run_repl(
     ccxml_path: Path | None = None,
     commands_path: Path | None = None,
     line_parsers: Iterable[LineParser] = (),
-    command_parsers: Mapping[str, CommandParser] | None = None,
+    command_parsers: Mapping[type[Command], CommandParser] | None = None,
 ) -> int:
     """
     Runs the interactive REPL script.
@@ -350,7 +475,8 @@ def run_repl(
     If `line_parsers` is given, each is called with every line the REPL prints to
     stdout (stdin stays interactive, stderr is untouched). Output is still echoed
     to this process's stdout as it arrives.
-    If `command_parsers` is given, running a command whose name is a key in it (e.g.
+    If `command_parsers` is given, running a command whose resolved `Command`
+    subclass (see `COMMAND_ALIASES`) is a key in it (e.g. `BacktraceCommand` for
     "bt") hands that command's output lines to the matching parser instead of
     printing them raw - typically used to render a command's output as a Rich table.
     Returns the exit code from the DSS process.

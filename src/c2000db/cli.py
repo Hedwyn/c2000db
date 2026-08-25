@@ -19,10 +19,15 @@ from rich.table import Table
 
 from .ccxml import CCXMLConfig, DebugProbe, dump_ccxml_config
 from .interface import (
-    LOCATION_COMMANDS,
+    BacktraceCommand,
+    Command,
+    CommandParser,
+    FrameCommand,
+    LocationCommand,
+    MemCommand,
+    PrintCommand,
     check_dss_available,
     generate_ccxml_from_device_config,
-    is_location_command,
     run_repl,
     run_reset,
 )
@@ -35,9 +40,18 @@ from .render import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from contextlib import AbstractContextManager
 
 DEFAULT_DEVICE_PATH = Path("c2000_device.json")
+
+REPL_COMMAND_PARSERS: Mapping[type[Command], CommandParser] = {
+    BacktraceCommand: render_backtrace,
+    FrameCommand: render_frame_source,
+    MemCommand: render_mem,
+    PrintCommand: render_print,
+    LocationCommand: render_current_line,
+}
 
 
 def err_exit(msg: str, code: int = 1) -> NoReturn:
@@ -135,14 +149,7 @@ def repl(ccxml: Path | None, device: Path | None, commands_path: Path | None) ->
             run_repl(
                 ccxml_path=generated_ccxml,
                 commands_path=commands_path,
-                command_parsers={
-                    "bt": render_backtrace,
-                    "frame": render_frame_source,
-                    "mem": render_mem,
-                    "print": render_print,
-                    "p": render_print,
-                    **{name: render_current_line for name in LOCATION_COMMANDS if is_location_command(name)},
-                },
+                command_parsers=REPL_COMMAND_PARSERS,
             ),
         )
 

@@ -17,6 +17,8 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
+from .interface import Command, FrameCommand, MemCommand
+
 # Matches one frame line as printed by `session.callStack.getStackTrace()`.
 # `func` has to tolerate an argument list (with spaces, pointers, etc.) inside the
 # parens, not just "()" - greedy `.+\)` grabs up to the *last* ")" on the line, which
@@ -73,13 +75,17 @@ def parse_backtrace_frames(lines: Iterable[str]) -> tuple[list[BacktraceFrame], 
     return frames, notes
 
 
-def render_backtrace(args: str, lines: Iterable[str], console: Console | None = None) -> None:
+def render_backtrace(
+    command: Command,
+    lines: Iterable[str],
+    console: Console | None = None,
+) -> None:
     """
     `bt` command parser: renders the call stack as a Rich table (one row per frame).
     Frame 0 - where the target is actually stopped - is marked "▶ current"; jump
     back to it with `frame 0` after exploring frames further up the stack.
     """
-    _ = args  # bt takes no arguments - only present to comply with CommandParser
+    _ = command  # bt takes no arguments - only present to comply with CommandParser
     console = console or Console()
     frames, notes = parse_backtrace_frames(lines)
 
@@ -144,7 +150,7 @@ def _render_frame_panel(frame: BacktraceFrame, console: Console, context: int) -
 
 
 def render_frame_source(
-    args: str,
+    command: Command,
     lines: Iterable[str],
     console: Console | None = None,
     context: int = 15,
@@ -154,19 +160,14 @@ def render_frame_source(
     "frame" command re-emits the same trace format as `bt`) and renders its source
     file around the target line with `rich.syntax.Syntax`.
     """
+    assert isinstance(command, FrameCommand), "only ever registered for FrameCommand"
     console = console or Console()
     frames, notes = parse_backtrace_frames(lines)
 
-    try:
-        index = int(args.strip())
-    except ValueError:
-        console.print(f"[red]frame: expected a frame number, got {args!r}[/red]")
-        return
-
-    frame = next((f for f in frames if f.index == index), None)
+    frame = next((f for f in frames if f.index == command.frame_index), None)
     if frame is None:
         valid = ", ".join(str(f.index) for f in frames) or "none"
-        console.print(f"[red]frame: no frame {index} (valid: {valid})[/red]")
+        console.print(f"[red]frame: no frame {command.frame_index} (valid: {valid})[/red]")
         for note in notes:
             console.print(f"[yellow]{note}[/yellow]")
         return
@@ -175,7 +176,7 @@ def render_frame_source(
 
 
 def render_current_line(
-    args: str,
+    command: Command,
     lines: Iterable[str],
     console: Console | None = None,
     context: int = 15,
@@ -190,7 +191,7 @@ def render_current_line(
     debug info at the current PC, such as right at a function's entry before its
     frame is set up), everything is printed as plain text instead of guessing.
     """
-    _ = args  # these commands take no arguments - only present to comply with CommandParser
+    _ = command  # these commands take no arguments - only present to comply with CommandParser
     console = console or Console()
     frames, notes = parse_backtrace_frames(lines)
     for note in notes:
@@ -203,13 +204,14 @@ def render_current_line(
         _render_frame_panel(current, console, context)
 
 
-def render_mem(args: str, lines: Iterable[str], console: Console | None = None) -> None:
+def render_mem(command: Command, lines: Iterable[str], console: Console | None = None) -> None:
     """
     `mem` command parser: renders the "<addr>: <value>" dump as a Rich table
     (address / hex / decimal columns) instead of a raw list of lines.
     """
+    assert isinstance(command, MemCommand), "render_mem is only ever registered for MemCommand"
     console = console or Console()
-    table = Table(title="Memory", caption=f"mem {args}" if args else None)
+    table = Table(title="Memory", caption=f"mem {command.raw_args}" if command.raw_args else None)
     table.add_column("Address", justify="right", style="cyan")
     table.add_column("Hex", style="magenta")
     table.add_column("Decimal", justify="right")
@@ -231,13 +233,13 @@ def render_mem(args: str, lines: Iterable[str], console: Console | None = None) 
         console.print(f"[yellow]{note}[/yellow]")
 
 
-def render_print(args: str, lines: Iterable[str], console: Console | None = None) -> None:
+def render_print(command: Command, lines: Iterable[str], console: Console | None = None) -> None:
     """
     `print`/`p` command parser: re-styles "expr = value (hex)" into a compact,
     colorized line instead of plain text. Lines that don't match that shape (e.g.
     an evaluation error) are printed as-is.
     """
-    _ = args  # the expression is already embedded in the output line itself
+    _ = command  # the expression is already embedded in the output line itself
     console = console or Console()
     for line in lines:
         stripped = line.strip()
