@@ -94,7 +94,7 @@ function help() {
         "break <symbol|0xADDR>      - set breakpoint, prints its id",
         "delete <id> | clearbp",
         "print <expr>                - evaluate a C expression / register (e.g. PC, ACC, a global)",
-        "mem <0xADDR> <count> [prog|data]  - dump <count> 16-bit words (default page: data)",
+        "mem [0xADDR] [count] [prog|data]  - dump <count> 16-bit words (default: SP-count, 16, data)",
         "write <0xADDR> <0xVALUE>   - write one 16-bit word (data page)",
         "bt                          - print call stack",
         "frame <n>                  - show call stack frame n's source location",
@@ -205,14 +205,55 @@ function execCommand(line) {
             case "print":
             case "p":
                 var expr = parts.slice(1).join(" ");
-                var val = session.expression.evaluate(expr);
-                print(expr + " = " + val + " (" + hex(val) + ")");
+                // Independently try/caught from the address lookup below: DSS's
+                // expression evaluator can only represent a *scalar* result as
+                // this "val" (long), and throws (an internal NPE, observed on
+                // real hardware) for a struct/union-by-value expression - that
+                // must not stop the address lookup below, which is exactly the
+                // case interface.py's struct-aware print (see render_print)
+                // needs it for.
+                try {
+                    var val = session.expression.evaluate(expr);
+                    print(expr + " = " + val + " (" + hex(val) + ")");
+                } catch (e) {
+                    print(expr + ": " + e);
+                }
+                // Best-effort extras for interface.py's struct-aware print: the
+                // expression's own address, so a follow-up "mem" can read its
+                // raw words, and the current PC, so the Python side can resolve
+                // which function scope (and so which DWARF type) `expr` belongs
+                // to. Silently omitted if `expr` has no address (e.g. a register
+                // alias like PC, or a literal).
+                try {
+                    var addr = session.expression.evaluate("&(" + expr + ")");
+                    print("addr = " + hex(addr));
+                    print("pc = " + hex(session.expression.evaluate("PC")));
+                } catch (e) {
+                    // Surfaced (not swallowed) - interface.py's struct-aware print
+                    // (see render_print) just falls back to the scalar line above
+                    // either way, so this is purely diagnostic for a human reading
+                    // raw REPL output.
+                    print("print: no address for '" + expr + "': " + e);
+                }
                 break;
             case "mem":
-                var addr = parseAddress(parts[1]);
-                var count = parseInt(parts[2] || "1", 10);
+                // With no address given, default to just below the current stack
+                // pointer - locals sit at *negative* offsets from SP (compiler
+                // allocates them below SP, e.g. DW_OP_breg20 -22), so "mem" alone
+                // has to read backwards from SP to actually land on them, not
+                // forward into the caller's frame / return address.
+                var sp = session.expression.evaluate("SP");
+                var pc = session.expression.evaluate("PC");
+                var count = parseInt(parts[2] || "16", 10);
+                var addr = parts[1] ? parseAddress(parts[1]) : (sp - count);
                 var pg = page(parts[3]);
                 var data = session.memory.readData(pg, addr, 16, count);
+                // Printed unconditionally (not just for the default-address case) so
+                // interface.py's command parser can resolve local variables against
+                // the *current* frame even when an explicit, unrelated address is
+                // being dumped instead of SP.
+                print("sp = " + hex(sp));
+                print("pc = " + hex(pc));
                 for (var i = 0; i < data.length; i++) {
                     print(hex(addr + i) + ": " + hex(data[i]));
                 }

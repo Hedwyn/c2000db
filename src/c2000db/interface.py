@@ -16,11 +16,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import Field, dataclass, fields
 from io import BufferedReader
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol, Self, get_type_hints
+from typing import IO, TYPE_CHECKING, Any, ClassVar, Protocol, Self, get_type_hints
 
 from .ccxml import build_ccxml, load_ccxml_config
 
@@ -30,6 +31,12 @@ if TYPE_CHECKING:
 # Called with one output line (no trailing newline) at a time, in the order the
 # script printed them. A parser raising is caught and reported, not propagated.
 type LineParser = Callable[[str], None]
+
+# Writes one command line to the REPL child's stdin (as if a human had typed it)
+# and returns an iterator over *that* command's own output lines - same shape as
+# what a `CommandParser`/`InteractiveCommandParser` itself receives. Safe to call
+# more than once. See `InteractiveCommandParser`.
+type SendCommand = Callable[[str], Iterator[str]]
 
 
 class CommandParser(Protocol):
@@ -41,6 +48,20 @@ class CommandParser(Protocol):
     """
 
     def __call__(self, command: Command, lines: Iterable[str]) -> None: ...
+
+
+class InteractiveCommandParser(Protocol):
+    """
+    Like `CommandParser`, but also gets a `send` callback for issuing one or more
+    *follow-up* commands to the same REPL child before finishing its render - e.g.
+    a struct-aware `print` that resolves an expression's address and DWARF type,
+    then uses `send` to fetch the raw words at that address the same way `mem`
+    would, and renders a nested tree instead of `mem`'s flat dump. Checked before
+    `command_parsers` in `run_repl`, so a command can only be handled by one of
+    the two registries.
+    """
+
+    def __call__(self, command: Command, lines: Iterable[str], send: SendCommand) -> None: ...
 
 
 # The REPL echoes every command it runs as its own "dbg> <cmd>" line - must match
@@ -79,27 +100,32 @@ class Command(Protocol):
     def parse(cls, args: str) -> Self:
         """
         Fills this dataclass's fields, in declaration order, from whitespace-
-        separated tokens in `args`, casting each to its field's declared type - a
-        `str` field always consumes the rest of the line (so e.g. `MemCommand`'s
-        one field gets the full "<addr> <count>" text), anything else consumes one
-        token. A field with nothing left to consume keeps its declared default,
-        which is what lets any/every argument be omitted.
+        separated tokens in `args`, casting each to its field's declared type - the
+        last field consumes the rest of the line instead of just one token if it's
+        a `str` (so e.g. `UnknownCommand`'s one field gets the full raw text; a
+        leading `str` field ahead of other fields, e.g. `MemCommand.address`, still
+        only consumes one token). A field with nothing left to consume keeps its
+        declared default, which is what lets any/every trailing argument be omitted.
         """
         command_fields = fields(cls)
         field_types = get_type_hints(cls)
+        last_index = len(command_fields) - 1
         remaining = args.strip()
         kwargs: dict[str, object] = {}
-        for field in command_fields:
+        for index, field in enumerate(command_fields):
             if not field.init or not remaining:
                 break
             field_type = field_types[field.name]
-            if field_type is str:
+            if field_type is str and index == last_index:
                 kwargs[field.name] = remaining
                 remaining = ""
+                continue
+            token, _, remaining = remaining.partition(" ")
+            remaining = remaining.strip()
+            if field_type is str:
+                kwargs[field.name] = token
             elif field_type is int:
-                token, _, remaining = remaining.partition(" ")
                 kwargs[field.name] = int(token)
-                remaining = remaining.strip()
             else:
                 raise TypeError(
                     f"{cls.__name__}.{field.name}: Command.parse has no generic support "
@@ -131,12 +157,20 @@ class FrameCommand(Command):
 class MemCommand(Command):
     aliases: ClassVar[tuple[str, ...]] = ("mem",)
 
-    raw_args: str = ""
+    # Mirrors repl.js's own defaults for a bare "mem": anchored at the stack
+    # pointer (repl.js actually starts `count` words *below* SP, since locals sit
+    # at negative offsets from it - see js/repl.js) and 16 words - enough to
+    # cover a typical frame without flooding the output.
+    address: str = "SP"
+    count: int = 16
+    target: str = "data"
 
 
 @dataclass(frozen=True)
 class PrintCommand(Command):
     aliases: ClassVar[tuple[str, ...]] = ("print", "p")
+
+    expression: str = ""
 
 
 @dataclass(frozen=True)
@@ -424,10 +458,31 @@ def _run_command_parser(
             pass
 
 
+def _run_interactive_command_parser(
+    parser: InteractiveCommandParser,
+    command_cls: type[Command],
+    args: str,
+    lines: Iterator[str],
+    send: SendCommand,
+) -> None:
+    try:
+        command = command_cls.parse(args)
+        parser(command, lines, send)
+    except Exception as exc:  # noqa: BLE001 - a broken parser must not kill the REPL
+        print(f"[c2000db] interactive command parser {parser!r} raised: {exc!r}", file=sys.stderr)  # noqa: T201
+    finally:
+        for _ in lines:
+            pass
+
+
 def _pump_and_parse_stdout(
     stdout: BufferedReader,
+    child_stdin: IO[bytes],
+    stdin_lock: threading.Lock,
     line_parsers: Sequence[LineParser],
     command_parsers: Mapping[type[Command], CommandParser],
+    interactive_command_parsers: Mapping[type[Command], InteractiveCommandParser],
+    script_lines: Iterable[str] = (),
 ) -> None:
     """
     Echoes `stdout` to this process's stdout as it arrives, while additionally:
@@ -439,19 +494,61 @@ def _pump_and_parse_stdout(
         renders. The raw text that followed the command name is parsed into that
         class via `Command.parse` before the parser sees it, so a parser only ever
         deals with typed, defaulted fields - never a raw argument string.
+      * same, but for `interactive_command_parsers` (checked first): the parser
+        additionally gets a `send` callback (built here, closing over this same
+        `lines` generator and `child_stdin`) it can use to issue its own follow-up
+        commands - see `InteractiveCommandParser`.
+      * feeding `script_lines` into `child_stdin` itself, one at a time, only
+        once each prior command's *entire* processing (including any of its own
+        `send` follow-ups) has finished - see `run_repl` for why this can't be
+        left to repl.js's own DSS_COMMANDS file-reading whenever
+        `interactive_command_parsers` is in play.
 
-    `stdin` is left untouched by the caller, so a REPL child stays fully interactive
-    while its stdout is being observed.
+    A human can still type interactively while this runs (once `script_lines` is
+    exhausted): `child_stdin` is also fed by a background thread relaying this
+    process's own stdin (see `_forward_stdin` in `run_repl`) - `stdin_lock`
+    serializes writes between that thread, `send`, and the script feeder.
     """
     lines = _iter_output_lines(stdout, line_parsers)
+    pending_script = list(script_lines)
+
+    def write_line(command_line: str) -> None:
+        with stdin_lock:
+            child_stdin.write((command_line + "\n").encode())
+            child_stdin.flush()
+
+    def send(command_line: str) -> Iterator[str]:
+        write_line(command_line)
+        # Consume the child's own "dbg> <cmd>" echo of the line we just sent,
+        # same as a human-typed command gets - everything after it, up to its
+        # end-of-command marker, is this follow-up command's actual output.
+        for echoed in lines:
+            if echoed.startswith(_PROMPT_PREFIX):
+                break
+        return gather_command_output(lines)
+
+    if pending_script:
+        write_line(pending_script.pop(0))
+
     for line in lines:
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
         if line.startswith(_PROMPT_PREFIX):
             command_name, _, args = line.removeprefix(_PROMPT_PREFIX).partition(" ")
             command_cls = COMMAND_ALIASES.get(command_name, UnknownCommand)
-            parser = command_parsers.get(command_cls, _echo_command_output)
-            _run_command_parser(parser, command_cls, args, gather_command_output(lines))
+            if interactive_parser := interactive_command_parsers.get(command_cls):
+                _run_interactive_command_parser(
+                    interactive_parser,
+                    command_cls,
+                    args,
+                    gather_command_output(lines),
+                    send,
+                )
+            else:
+                parser = command_parsers.get(command_cls, _echo_command_output)
+                _run_command_parser(parser, command_cls, args, gather_command_output(lines))
+            if pending_script:
+                write_line(pending_script.pop(0))
 
 
 def run_reset(dss_location: Path | None = None, ccxml_path: Path | None = None) -> int:
@@ -461,33 +558,111 @@ def run_reset(dss_location: Path | None = None, ccxml_path: Path | None = None) 
     return run_script("reset", dss_location=dss_location, ccxml_path=ccxml_path)
 
 
+def _forward_stdin(child_stdin: IO[bytes], stdin_lock: threading.Lock) -> None:
+    """
+    Relays this process's own stdin to the REPL child's stdin, one line at a time,
+    so a human can still type interactively even though `run_repl` now pipes
+    stdin itself (needed for `send` - see `_pump_and_parse_stdout`). Runs until
+    our stdin hits EOF or the child's stdin pipe is gone (child exited while a
+    write was in flight - fine on the way out).
+    """
+    try:
+        while chunk := sys.stdin.buffer.readline():
+            with stdin_lock:
+                child_stdin.write(chunk)
+                child_stdin.flush()
+    except (BrokenPipeError, ValueError):
+        pass
+
+
+def _read_command_script(commands_path: Path) -> list[str]:
+    """
+    Reads a debugger command script the same way repl.js's own `runCommandScript`
+    does (blank lines and lines starting with '#' skipped) - used by `run_repl`
+    to feed it through `child_stdin` itself, instead of via `DSS_COMMANDS`,
+    whenever `interactive_command_parsers` is in play (see `run_repl`).
+    """
+    lines: list[str] = []
+    for raw_line in commands_path.read_text().splitlines():
+        stripped = raw_line.strip()
+        if stripped and not stripped.startswith("#"):
+            lines.append(stripped)
+    return lines
+
+
 def run_repl(
     dss_location: Path | None = None,
     ccxml_path: Path | None = None,
     commands_path: Path | None = None,
     line_parsers: Iterable[LineParser] = (),
     command_parsers: Mapping[type[Command], CommandParser] | None = None,
+    interactive_command_parsers: Mapping[type[Command], InteractiveCommandParser] | None = None,
 ) -> int:
     """
     Runs the interactive REPL script.
     If `commands_path` is given, its lines are run as debugger commands
-    before dropping into the interactive prompt (like `gdb -x`).
+    before dropping into the interactive prompt (like `gdb -x`) - ordinarily via
+    repl.js's own `DSS_COMMANDS`-driven file reading, *unless*
+    `interactive_command_parsers` is given (see below), in which case this
+    process feeds them through `child_stdin` itself instead (see
+    `_read_command_script`, `_pump_and_parse_stdout`).
     If `line_parsers` is given, each is called with every line the REPL prints to
-    stdout (stdin stays interactive, stderr is untouched). Output is still echoed
-    to this process's stdout as it arrives.
+    stdout (stderr is untouched). Output is still echoed to this process's stdout
+    as it arrives.
     If `command_parsers` is given, running a command whose resolved `Command`
     subclass (see `COMMAND_ALIASES`) is a key in it (e.g. `BacktraceCommand` for
     "bt") hands that command's output lines to the matching parser instead of
     printing them raw - typically used to render a command's output as a Rich table.
+    If `interactive_command_parsers` is given, same idea but the parser can also
+    issue its own follow-up commands to the child - see `InteractiveCommandParser`.
+    That capability is why `commands_path` can't be left to repl.js's own
+    DSS_COMMANDS file-reading here: that loop never checks stdin between script
+    lines, so a follow-up written to it would sit unread while repl.js raced
+    ahead to the *next* script line - whose own output `send` would then
+    mistake for the follow-up's.
+    Registering either kind of parser means this process now mediates stdin too
+    (needed so a parser's follow-up commands, this process's own script-line
+    feeding, and a human's typing don't race each other) - see `_forward_stdin`
+    - rather than the child inheriting it directly.
     Returns the exit code from the DSS process.
     """
     parsers = list(line_parsers)
-    command, env = _build_dss_invocation("repl", dss_location, ccxml_path, commands_path)
-    if not parsers and not command_parsers:
+    interactive_parsers = interactive_command_parsers or {}
+    if not parsers and not command_parsers and not interactive_parsers:
+        command, env = _build_dss_invocation("repl", dss_location, ccxml_path, commands_path)
         proc = subprocess.run(command, check=False, env=env)  # noqa: S603
         return proc.returncode
 
-    with subprocess.Popen(command, env=env, stdout=subprocess.PIPE) as repl_proc:  # noqa: S603
+    # DSS_COMMANDS is only safe to leave to repl.js when nothing here will ever
+    # write a follow-up command mid-script - see the docstring above.
+    script_lines: list[str] = []
+    if commands_path is not None and interactive_parsers:
+        script_lines = _read_command_script(commands_path)
+        command, env = _build_dss_invocation("repl", dss_location, ccxml_path, None)
+    else:
+        command, env = _build_dss_invocation("repl", dss_location, ccxml_path, commands_path)
+
+    with subprocess.Popen(  # noqa: S603
+        command,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    ) as repl_proc:
         assert isinstance(repl_proc.stdout, BufferedReader), "stdout explicitly piped above"
-        _pump_and_parse_stdout(repl_proc.stdout, parsers, command_parsers or {})
+        assert repl_proc.stdin is not None, "stdin explicitly piped above"
+        stdin_lock = threading.Lock()
+        threading.Thread(
+            target=_forward_stdin,
+            args=(repl_proc.stdin, stdin_lock),
+            daemon=True,
+        ).start()
+        _pump_and_parse_stdout(
+            repl_proc.stdout,
+            repl_proc.stdin,
+            stdin_lock,
+            parsers,
+            command_parsers or {},
+            interactive_parsers,
+            script_lines,
+        )
         return repl_proc.wait()

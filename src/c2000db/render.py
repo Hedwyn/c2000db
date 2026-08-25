@@ -11,13 +11,21 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
+from rich.tree import Tree
 
-from .interface import Command, FrameCommand, MemCommand
+from . import debug_info
+from .interface import Command, FrameCommand, MemCommand, PrintCommand
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from .interface import SendCommand
 
 # Matches one frame line as printed by `session.callStack.getStackTrace()`.
 # `func` has to tolerate an argument list (with spaces, pointers, etc.) inside the
@@ -31,6 +39,11 @@ _BT_FRAME_RE = re.compile(
 
 # Matches one `mem` line, e.g.: 0x80007: 0xaa55
 _MEM_LINE_RE = re.compile(r"^(?P<addr>0x[0-9A-Fa-f]+):\s*(?P<value>0x[0-9A-Fa-f]+)\s*$")
+
+# Matches the "sp = 0x...", "pc = 0x..." lines repl.js prints ahead of a `mem`
+# dump, and the "addr = 0x...", "pc = 0x..." lines it prints after a `print`
+# whose expression has an address (see js/repl.js).
+_LABELED_HEX_RE = re.compile(r"^(?P<name>sp|pc|addr) = (?P<value>0x[0-9A-Fa-f]+)\s*$")
 
 # Matches `print`/`p` output, e.g.: afpu = 3145778 (0x300032)
 _PRINT_RE = re.compile(r"^(?P<expr>.+) = (?P<dec>-?\d+) \((?P<hex>0x[0-9A-Fa-f]+)\)\s*$")
@@ -204,53 +217,338 @@ def render_current_line(
         _render_frame_panel(current, console, context)
 
 
-def render_mem(command: Command, lines: Iterable[str], console: Console | None = None) -> None:
-    """
-    `mem` command parser: renders the "<addr>: <value>" dump as a Rich table
-    (address / hex / decimal columns) instead of a raw list of lines.
-    """
-    assert isinstance(command, MemCommand), "render_mem is only ever registered for MemCommand"
-    console = console or Console()
-    table = Table(title="Memory", caption=f"mem {command.raw_args}" if command.raw_args else None)
-    table.add_column("Address", justify="right", style="cyan")
-    table.add_column("Hex", style="magenta")
-    table.add_column("Decimal", justify="right")
+@dataclass(frozen=True)
+class _MemWord:
+    address: int
+    hex_text: str
+    value_text: str
+    value: int
 
+
+def _parse_mem_lines(
+    lines: Iterable[str],
+) -> tuple[list[_MemWord], int | None, int | None, list[str]]:
+    """
+    Splits a `mem` dump's lines into the address/value words, the `sp`/`pc` repl.js
+    prints alongside them (`None` if either is missing - e.g. an older repl.js),
+    and any other line (e.g. an error) that matches neither.
+    """
+    words: list[_MemWord] = []
+    sp: int | None = None
+    pc: int | None = None
     notes: list[str] = []
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
+        if (register_match := _LABELED_HEX_RE.match(stripped)) is not None:
+            value = int(register_match["value"], 16)
+            if register_match["name"] == "sp":
+                sp = value
+            elif register_match["name"] == "pc":
+                pc = value
+            # "addr" doesn't appear in `mem`'s own output (only `print`'s) - see
+            # `_parse_print_lines` - so nothing to do with it here.
+            continue
         match = _MEM_LINE_RE.match(stripped)
         if match is None:
             notes.append(stripped)
             continue
-        table.add_row(match["addr"], match["value"], str(int(match["value"], 16)))
+        address, value = int(match["addr"], 16), int(match["value"], 16)
+        words.append(_MemWord(address, match["addr"], match["value"], value))
+    return words, sp, pc, notes
 
-    if table.row_count:
+
+def render_mem(command: Command, lines: Iterable[str], console: Console | None = None) -> None:
+    """
+    `mem` command parser: renders the dumped words in a vertical (transposed)
+    table - one column per address, one row per representation - with a
+    "Variable" row naming the local variable/parameter (if any, via
+    `debug_info.local_variable_at`) covering that address in the current frame.
+    Empty wherever nothing there is stack-resident (e.g. a `prog`-page dump, or an
+    address outside the current frame).
+    """
+    assert isinstance(command, MemCommand), "render_mem is only ever registered for MemCommand"
+    console = console or Console()
+    words, sp, pc, notes = _parse_mem_lines(lines)
+
+    scopes: tuple[debug_info.FunctionScope, ...] = ()
+    if sp is not None and pc is not None and command.target == "data":
+        try:
+            scopes = debug_info.load_debug_info(debug_info.DEFAULT_OUT_PATH).scopes
+        except Exception as exc:  # noqa: BLE001 - locals annotation is best-effort, never fatal to `mem`
+            console.print(f"[yellow]mem: local variable lookup unavailable: {exc!r}[/yellow]")
+
+    table = Table(title="Memory", caption=f"mem {command.address} {command.count} {command.target}")
+    table.add_column("")
+    for word in words:
+        table.add_column(word.hex_text, justify="right", style="cyan")
+
+    if words:
+        table.add_row("Hex", *(word.value_text for word in words), style="magenta")
+        table.add_row("Decimal", *(str(word.value) for word in words))
+        if sp is not None and pc is not None:
+            variables = (
+                debug_info.local_variable_at(scopes, pc, sp, word.address) or "" for word in words
+            )
+            table.add_row("Variable", *variables, style="green")
         console.print(table)
     for note in notes:
         console.print(f"[yellow]{note}[/yellow]")
 
 
-def render_print(command: Command, lines: Iterable[str], console: Console | None = None) -> None:
+@dataclass(frozen=True)
+class _PrintLines:
+    scalar_display: str | None  # already-colorized "expr = dec (hex)", or None if it didn't match
+    scalar_value: int | None  # that same value, unsigned - e.g. a pointer's own target address
+    addr: (
+        int | None
+    )  # the expression's own address, if repl.js could take it (see js/repl.js's "print")
+    pc: int | None  # the current PC, reported alongside `addr`
+    notes: list[str]
+
+
+def _parse_print_lines(lines: Iterable[str]) -> _PrintLines:
     """
-    `print`/`p` command parser: re-styles "expr = value (hex)" into a compact,
-    colorized line instead of plain text. Lines that don't match that shape (e.g.
-    an evaluation error) are printed as-is.
+    Splits a `print` command's lines into the flat scalar result, the
+    expression's own address and the current PC if repl.js reported them (both
+    `None` when the expression has no address, e.g. a bare register), and any
+    other line (e.g. an evaluation error).
     """
-    _ = command  # the expression is already embedded in the output line itself
-    console = console or Console()
+    scalar_display: str | None = None
+    scalar_value: int | None = None
+    addr: int | None = None
+    pc: int | None = None
+    notes: list[str] = []
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
+        if (register_match := _LABELED_HEX_RE.match(stripped)) is not None:
+            value = int(register_match["value"], 16)
+            if register_match["name"] == "addr":
+                addr = value
+            elif register_match["name"] == "pc":
+                pc = value
+            continue
         match = _PRINT_RE.match(stripped)
         if match is None:
-            console.print(stripped)
+            notes.append(stripped)
             continue
-        console.print(
+        # `hex`, not `dec`, for the numeric value: JS's hex() (Long.toHexString)
+        # always renders unsigned, so this is safe to use as an address (e.g. a
+        # pointer's own value) without worrying about `dec`'s sign.
+        scalar_value = int(match["hex"], 16)
+        scalar_display = (
             f"[bold cyan]{match['expr']}[/bold cyan] [dim]=[/dim] "
             f"[bold green]{match['dec']}[/bold green] "
-            f"[dim]([/dim][yellow]{match['hex']}[/yellow][dim])[/dim]",
+            f"[dim]([/dim][yellow]{match['hex']}[/yellow][dim])[/dim]"
         )
+    return _PrintLines(scalar_display, scalar_value, addr, pc, notes)
+
+
+def _find_variable(
+    info: debug_info.DebugInfo,
+    pc: int,
+    name: str,
+) -> debug_info.LocalVariable | debug_info.GlobalVariable | None:
+    """
+    A local in the function scope containing `pc` takes priority (matches C's
+    own shadowing rules for a same-named local vs. global); falls back to a
+    global/file-static otherwise - see `debug_info.GlobalVariable` for why that
+    fallback isn't itself scope-aware.
+    """
+    for scope in info.scopes:
+        if scope.contains(pc):
+            local = next((variable for variable in scope.variables if variable.name == name), None)
+            if local is not None:
+                return local
+            break
+    return next((variable for variable in info.globals if variable.name == name), None)
+
+
+# Hard caps so a bad DWARF size (or a genuinely huge struct/array) can't hang the
+# REPL on one `print` - dropped words/items are called out, never silently cut.
+_MAX_DECODE_WORDS = 2048
+_MAX_DECODE_ITEMS = 64
+
+
+def _fetch_words(send: SendCommand, addr: int, count: int, console: Console) -> list[int] | None:
+    """Reads `count` words at `addr` via a follow-up `mem`-equivalent `send` call."""
+    capped = min(count, _MAX_DECODE_WORDS)
+    if capped < count:
+        console.print(
+            f"[yellow]print: {count} words is over the {_MAX_DECODE_WORDS}-word decode cap - "
+            f"showing only the first {capped}[/yellow]",
+        )
+    if capped <= 0:
+        return []
+    words, _sp, _pc, notes = _parse_mem_lines(send(f"mem {hex(addr)} {capped} data"))
+    for note in notes:
+        console.print(f"[yellow]{note}[/yellow]")
+    if len(words) != capped:
+        console.print(
+            f"[yellow]print: expected {capped} words back, got {len(words)} - "
+            "falling back to the scalar line[/yellow]",
+        )
+        return None
+    return [word.value for word in words]
+
+
+def _format_words(words: Sequence[int], offset: int, size: int) -> str:
+    """
+    Formats `size` consecutive words from `words` starting at `offset`, as raw
+    hex words - used for anything wider than one word (a multi-word base type, a
+    2-word pointer, ...), since this target's cross-word ordering for such a
+    value hasn't been verified against real hardware; showing raw words avoids a
+    confidently-wrong assembled number.
+    """
+    chunk = words[offset : offset + max(size, 0)]
+    if not chunk:
+        return "?"
+    return " ".join(hex(word & 0xFFFF) for word in chunk)
+
+
+def _format_scalar(base_type: debug_info.BaseType, words: Sequence[int], offset: int) -> str:
+    chunk = words[offset : offset + max(base_type.size, 0)]
+    if len(chunk) != 1:
+        return _format_words(words, offset, base_type.size)
+    raw = chunk[0] & 0xFFFF
+    if base_type.encoding == 2:  # DW_ATE_boolean
+        return "true" if raw else "false"
+    if base_type.encoding in (5, 6):  # DW_ATE_signed / DW_ATE_signed_char
+        signed = raw - 0x10000 if raw >= 0x8000 else raw
+        return f"{signed} ({hex(raw)})"
+    return f"{raw} ({hex(raw)})"
+
+
+def _unflatten_index(flat_index: int, counts: Sequence[int]) -> tuple[int, ...]:
+    """Row-major index decomposition, e.g. for `int a[2][3]`, flat index 4 -> (1, 1)."""
+    indices: list[int] = []
+    remaining = flat_index
+    for count in reversed(counts):
+        indices.append(remaining % count if count else 0)
+        remaining //= count or 1
+    return tuple(reversed(indices))
+
+
+def _decode_into(
+    node: Tree, value_type: debug_info.Type, words: Sequence[int], word_offset: int
+) -> None:
+    """Recursively expands `value_type` (at `word_offset` into `words`) as children of `node`."""
+    if isinstance(value_type, debug_info.CompositeType):
+        for member in value_type.members[:_MAX_DECODE_ITEMS]:
+            child = node.add(f"[bold]{member.name}[/bold]")
+            _decode_into(child, member.type, words, word_offset + member.offset)
+        if len(value_type.members) > _MAX_DECODE_ITEMS:
+            node.add(f"[dim]... {len(value_type.members) - _MAX_DECODE_ITEMS} more members[/dim]")
+        return
+    if isinstance(value_type, debug_info.ArrayType):
+        element_size = value_type.element.size or 1
+        total = 1
+        for count in value_type.counts:
+            total *= count
+        shown = min(total, _MAX_DECODE_ITEMS)
+        for flat_index in range(shown):
+            label = "".join(f"[{i}]" for i in _unflatten_index(flat_index, value_type.counts))
+            child = node.add(label)
+            _decode_into(child, value_type.element, words, word_offset + flat_index * element_size)
+        if total > shown:
+            node.add(f"[dim]... {total - shown} more elements[/dim]")
+        return
+    if isinstance(value_type, debug_info.PointerType):
+        node.label = (
+            f"{node.label} [magenta]= {_format_words(words, word_offset, value_type.size)}"
+            "[/magenta] [dim](pointer, not dereferenced)[/dim]"
+        )
+        return
+    if isinstance(value_type, debug_info.EnumType):
+        chunk = words[word_offset : word_offset + max(value_type.size, 0)]
+        if len(chunk) == 1:
+            raw = chunk[0] & 0xFFFF
+            name = next(
+                (enum_name for enum_value, enum_name in value_type.values if enum_value == raw),
+                None,
+            )
+            shown_value = f"{name} ({raw})" if name is not None else str(raw)
+        else:
+            shown_value = _format_words(words, word_offset, value_type.size)
+        node.label = f"{node.label} [green]= {shown_value}[/green]"
+        return
+    # BaseType, or the fallback `debug_info.resolve_type` returns for a tag it
+    # doesn't model further (e.g. a function pointer's target) - see BaseType.
+    node.label = f"{node.label} [green]= {_format_scalar(value_type, words, word_offset)}[/green]"
+
+
+def _render_struct_tree(
+    label: str,
+    value_type: debug_info.Type,
+    addr: int,
+    send: SendCommand,
+    console: Console,
+) -> bool:
+    """Fetches `value_type`'s raw words at `addr` via `send` and prints a nested tree. Returns whether it succeeded."""
+    words = _fetch_words(send, addr, value_type.size, console)
+    if words is None:
+        return False
+    tree = Tree(f"{label} [dim]@ {hex(addr)}[/dim]")
+    _decode_into(tree, value_type, words, 0)
+    console.print(tree)
+    return True
+
+
+def render_print(
+    command: Command, lines: Iterable[str], send: SendCommand, console: Console | None = None
+) -> None:
+    """
+    `print`/`p` command parser: for a bare local/global name whose DWARF type
+    (see debug_info.py) is a struct/union/array, fetches its raw words via a
+    follow-up `mem`-equivalent `send` call (see `InteractiveCommandParser`) and
+    renders a nested Rich tree. A pointer *to* one is dereferenced one level the
+    same way (using its own value - not `&expr` - as the address, and its
+    pointee's DWARF type via `DebugInfo.resolve_pointee`) - a null pointer, or a
+    pointer nested inside an already-decoded struct's own fields, is left as a
+    raw address instead (see `_decode_into`'s `PointerType` case), to avoid
+    chasing a cycle (e.g. a linked list). Otherwise - a scalar, an arbitrary
+    expression `debug_info` can't resolve by name (e.g. `myStruct.field`), or
+    DWARF/`ofd2000` unavailable - falls back to a flat, colorized
+    "expr = dec (hex)" line, same as before this feature existed.
+    """
+    assert isinstance(command, PrintCommand), (
+        "render_print is only ever registered for PrintCommand"
+    )
+    console = console or Console()
+    parsed = _parse_print_lines(lines)
+    expr = command.expression.strip()
+
+    if parsed.addr is not None and parsed.pc is not None:
+        try:
+            info = debug_info.load_debug_info(debug_info.DEFAULT_OUT_PATH)
+        except Exception as exc:  # noqa: BLE001 - struct decoding is best-effort, never fatal to `print`
+            console.print(f"[yellow]print: struct decoding unavailable: {exc!r}[/yellow]")
+        else:
+            variable = _find_variable(info, parsed.pc, expr)
+            label = f"[bold cyan]{expr}[/bold cyan]"
+            decoded = False
+            if variable is not None:
+                if isinstance(variable.type, (debug_info.CompositeType, debug_info.ArrayType)):
+                    decoded = _render_struct_tree(label, variable.type, parsed.addr, send, console)
+                elif isinstance(variable.type, debug_info.PointerType) and parsed.scalar_value:
+                    pointee = info.resolve_pointee(variable.type)
+                    if isinstance(pointee, (debug_info.CompositeType, debug_info.ArrayType)):
+                        decoded = _render_struct_tree(
+                            f"{label} [dim]->[/dim]",
+                            pointee,
+                            parsed.scalar_value,
+                            send,
+                            console,
+                        )
+            if decoded:
+                for note in parsed.notes:
+                    console.print(f"[yellow]{note}[/yellow]")
+                return
+
+    if parsed.scalar_display is not None:
+        console.print(parsed.scalar_display)
+    for note in parsed.notes:
+        console.print(f"[yellow]{note}[/yellow]")

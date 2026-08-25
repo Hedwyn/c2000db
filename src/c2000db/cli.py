@@ -23,6 +23,7 @@ from .interface import (
     Command,
     CommandParser,
     FrameCommand,
+    InteractiveCommandParser,
     LocationCommand,
     MemCommand,
     PrintCommand,
@@ -49,8 +50,15 @@ REPL_COMMAND_PARSERS: Mapping[type[Command], CommandParser] = {
     BacktraceCommand: render_backtrace,
     FrameCommand: render_frame_source,
     MemCommand: render_mem,
-    PrintCommand: render_print,
     LocationCommand: render_current_line,
+}
+
+# `print`/`p` needs to issue its own follow-up commands (a struct-aware `print`
+# fetching a `mem`-equivalent raw dump - see render_print) - see
+# `InteractiveCommandParser` for why that's a separate registry from
+# `REPL_COMMAND_PARSERS`.
+REPL_INTERACTIVE_COMMAND_PARSERS: Mapping[type[Command], InteractiveCommandParser] = {
+    PrintCommand: render_print,
 }
 
 
@@ -150,6 +158,7 @@ def repl(ccxml: Path | None, device: Path | None, commands_path: Path | None) ->
                 ccxml_path=generated_ccxml,
                 commands_path=commands_path,
                 command_parsers=REPL_COMMAND_PARSERS,
+                interactive_command_parsers=REPL_INTERACTIVE_COMMAND_PARSERS,
             ),
         )
 
