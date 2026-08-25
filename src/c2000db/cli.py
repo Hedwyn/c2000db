@@ -9,15 +9,19 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
 
 import click
 from rich.console import Console
 from rich.table import Table
 
 from .ccxml import CCXMLConfig, DebugProbe, dump_ccxml_config
-from .interface import check_dss_available, generate_ccxml_from_device_config, run_repl
+from .interface import check_dss_available, generate_ccxml_from_device_config, run_repl, run_reset
+
+if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
 
 DEFAULT_DEVICE_PATH = Path("c2000_device.json")
 
@@ -50,6 +54,25 @@ def c2000_debugger() -> None:
     """
     Main entrypoint for all C2000 debugger commands
     """
+
+
+def _use_ccxml(
+    config_path: Path | None = None,
+    ccxml_path: Path | None = None,
+) -> AbstractContextManager[Path]:
+    """
+    Syntaxic sugar for the CCXML logic:
+    if a CCXML file is explicitly passed, we should use that one directly;
+    otherwise it should be generated from device config and cleared on exit.
+    Wraps the first case with a nullcontext so that this logic always
+    maps to a context manager.
+    """
+    if config_path is None and ccxml_path is None:
+        err_exit("You must pass a CCXML if not passing a device config")
+    if ccxml_path is not None:
+        return nullcontext(ccxml_path)
+    assert config_path is not None, "Checked above"
+    return generate_ccxml_from_device_config(config_path)
 
 
 @c2000_debugger.command()
@@ -85,14 +108,27 @@ def info() -> None:
     help="Path to JSON device configuration (generates CCXML)",
 )
 def repl(ccxml: Path | None, device: Path | None) -> None:
-    if device:
-        with generate_ccxml_from_device_config(device) as generated_ccxml:
-            exit_code = run_repl(ccxml_path=generated_ccxml)
-    else:
-        if ccxml is None:
-            err_exit("You must pass a CCXML if not passing a device config")
-        exit_code = run_repl(ccxml_path=ccxml)
-    sys.exit(exit_code)
+    with _use_ccxml(device, ccxml) as generated_ccxml:
+        sys.exit(run_repl(ccxml_path=generated_ccxml))
+
+
+@c2000_debugger.command()
+@click.option(
+    "--ccxml",
+    default=None,
+    type=click.Path(),
+    help="Path to CCXML configuration file (overrides DSS_CCXML env var)",
+)
+@click.option(
+    "-d",
+    "--device",
+    default=None,
+    callback=_resolve_device_path,
+    help="Path to JSON device configuration (generates CCXML)",
+)
+def reset(ccxml: Path | None, device: Path | None) -> None:
+    with _use_ccxml(device, ccxml) as ccxml_path:
+        sys.exit(run_reset(ccxml_path=ccxml_path))
 
 
 def _interactive_ccxml_config() -> CCXMLConfig:
