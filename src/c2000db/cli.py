@@ -107,9 +107,17 @@ def info() -> None:
     callback=_resolve_device_path,
     help="Path to JSON device configuration (generates CCXML)",
 )
-def repl(ccxml: Path | None, device: Path | None) -> None:
+@click.option(
+    "-x",
+    "--script",
+    "commands_path",
+    default=None,
+    type=click.Path(exists=True, path_type=Path),
+    help="Path to a script of debugger commands to run before dropping into the REPL",
+)
+def repl(ccxml: Path | None, device: Path | None, commands_path: Path | None) -> None:
     with _use_ccxml(device, ccxml) as generated_ccxml:
-        sys.exit(run_repl(ccxml_path=generated_ccxml))
+        sys.exit(run_repl(ccxml_path=generated_ccxml, commands_path=commands_path))
 
 
 @c2000_debugger.command()

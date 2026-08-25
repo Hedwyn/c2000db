@@ -139,7 +139,12 @@ def generate_ccxml_from_device_config(config_path: Path) -> Generator[Path]:
         yield ccxml_path
 
 
-def run_script(script: str, dss_location: Path | None, ccxml_path: Path | None = None) -> int:
+def run_script(
+    script: str,
+    dss_location: Path | None,
+    ccxml_path: Path | None = None,
+    commands_path: Path | None = None,
+) -> int:
     """
     Main helper to run a script with dss
     """
@@ -153,6 +158,8 @@ def run_script(script: str, dss_location: Path | None, ccxml_path: Path | None =
     env = os.environ.copy()
     if ccxml_path:
         env["DSS_CCXML"] = str(ccxml_path)
+    if commands_path:
+        env["DSS_COMMANDS"] = str(commands_path)
 
     proc = subprocess.run(command, check=False, env=env)  # noqa: S603
     return proc.returncode
@@ -165,10 +172,21 @@ def run_reset(dss_location: Path | None = None, ccxml_path: Path | None = None) 
     return run_script("reset", dss_location=dss_location, ccxml_path=ccxml_path)
 
 
-def run_repl(dss_location: Path | None = None, ccxml_path: Path | None = None) -> int:
+def run_repl(
+    dss_location: Path | None = None,
+    ccxml_path: Path | None = None,
+    commands_path: Path | None = None,
+) -> int:
     """
     Runs the interactive REPL script.
+    If `commands_path` is given, its lines are run as debugger commands
+    before dropping into the interactive prompt (like `gdb -x`).
     Returns the exit code from the DSS process.
     """
 
-    return run_script("repl", dss_location=dss_location, ccxml_path=ccxml_path)
+    return run_script(
+        "repl",
+        dss_location=dss_location,
+        ccxml_path=ccxml_path,
+        commands_path=commands_path,
+    )

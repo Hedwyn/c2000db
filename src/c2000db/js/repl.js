@@ -3,6 +3,11 @@
 //
 // Usage (from the repo root, so the relative paths below resolve):
 //   <ccs_install>/ccs/ccs_base/scripting/bin/dss.sh debug/repl.js
+//
+// Set DSS_COMMANDS to the path of a script of debugger commands (one per
+// line, blank lines and lines starting with '#' ignored) to run before
+// dropping into the interactive prompt - same idea as `gdb -x`. A `quit`
+// command in the script skips the interactive prompt entirely.
 
 importPackage(Packages.com.ti.debug.engine.scripting);
 importPackage(Packages.com.ti.ccstudio.scripting.environment);
@@ -15,6 +20,7 @@ if (!CCXML) {
     java.lang.System.exit(1);
 }
 var DEFAULT_OUT = "build/fw-boot.out";
+var COMMANDS_PATH = java.lang.System.getenv("DSS_COMMANDS");
 
 var env = ScriptingEnvironment.instance();
 env.traceSetConsoleLevel(TraceLevel.INFO);
@@ -69,18 +75,13 @@ function help() {
     ].join("\n"));
 }
 
-help();
-
-while (true) {
-    java.lang.System.out.print("dbg> ");
-    java.lang.System.out.flush();
-    var line = stdin.readLine();
-    if (line === null) {
-        break;
-    }
+// Runs a single command line. Returns false if the REPL should terminate
+// (e.g. on `quit`), true otherwise. Used for both the interactive prompt and
+// commands read from a DSS_COMMANDS script.
+function execCommand(line) {
     line = ("" + line).replace(/^\s+|\s+$/g, "");
     if (line === "") {
-        continue;
+        return true;
     }
     var parts = line.split(/\s+/);
     var cmd = parts[0];
@@ -182,16 +183,55 @@ while (true) {
             case "quit":
             case "exit":
             case "q":
-                throw "QUIT";
+                return false;
             default:
                 print("unknown command: " + cmd + " (try 'help')");
         }
     } catch (e) {
-        if (e === "QUIT") {
-            break;
-        }
         print("error: " + e);
     }
+    return true;
+}
+
+// Runs the commands found in the script at `path`, one per line. Blank lines
+// and lines starting with '#' are skipped. Returns false if a `quit`
+// command was hit (caller should not enter the interactive prompt).
+function runCommandScript(path) {
+    print("Running commands from " + path + " ...");
+    var reader = new BufferedReader(new FileReader(path));
+    try {
+        var line;
+        while ((line = reader.readLine()) !== null) {
+            var trimmed = ("" + line).replace(/^\s+|\s+$/g, "");
+            if (trimmed === "" || trimmed.indexOf("#") === 0) {
+                continue;
+            }
+            print("dbg> " + trimmed);
+            if (!execCommand(trimmed)) {
+                return false;
+            }
+        }
+    } finally {
+        reader.close();
+    }
+    return true;
+}
+
+help();
+
+var keepGoing = true;
+if (COMMANDS_PATH) {
+    keepGoing = runCommandScript(COMMANDS_PATH);
+}
+
+while (keepGoing) {
+    java.lang.System.out.print("dbg> ");
+    java.lang.System.out.flush();
+    var line = stdin.readLine();
+    if (line === null) {
+        break;
+    }
+    keepGoing = execCommand(line);
 }
 
 print("Disconnecting...");
