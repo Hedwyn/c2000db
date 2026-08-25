@@ -57,7 +57,26 @@ function parseAddress(token) {
     return java.lang.Long.decode(token).longValue();
 }
 
+// Prints the same full call-stack trace `bt`/`frame` print, so interface.py's
+// command parser for stepping commands can locate frame 0 (the current position)
+// exactly the same tolerant way `bt`/`frame` do - scanning every line for one that
+// matches the frame format, rather than assuming it's the first line of the trace.
+// Falls back to the old PC/symbol-only line if the stack trace isn't available at
+// all (e.g. no debug info at the current PC, such as inside Boot ROM) - either
+// because it throws, or because it returns blank without throwing (observed right
+// at a function's entry point, before its frame is set up enough to unwind even
+// frame 0). Silently printing that blank trace would otherwise swallow the whole
+// command's output, since blank lines are dropped by the line-based command parsers.
 function printLocation() {
+    try {
+        var trace = "" + session.callStack.getStackTrace();
+        if (trace.replace(/^\s+|\s+$/g, "") !== "") {
+            print(trace);
+            return;
+        }
+    } catch (e) {
+        // fall through to the PC-only fallback below
+    }
     var pc = session.expression.evaluate("PC");
     var sym = session.symbol.lookupSymbol(Memory.Page.PROGRAM, pc);
     print("PC = " + hex(pc) + (sym ? " (" + sym + ")" : ""));
@@ -70,13 +89,15 @@ function help() {
         "flash [out]                - reprogram device + load symbols (session.memory.loadProgram)",
         "halt | run/go/continue/c | reset | restart",
         "fire                        - like run, but doesn't read PC/location back (for timing tests)",
-        "step/si | next/over        - single asm instruction step (into / over a call)",
+        "step/s | next/n/over       - source-line step (into / over a call)",
+        "stepi/si | nexti           - single asm instruction step (into / over a call)",
         "break <symbol|0xADDR>      - set breakpoint, prints its id",
         "delete <id> | clearbp",
         "print <expr>                - evaluate a C expression / register (e.g. PC, ACC, a global)",
         "mem <0xADDR> <count> [prog|data]  - dump <count> 16-bit words (default page: data)",
         "write <0xADDR> <0xVALUE>   - write one 16-bit word (data page)",
         "bt                          - print call stack",
+        "frame <n>                  - show call stack frame n's source location",
         "help | quit",
     ].join("\n"));
 }
@@ -140,12 +161,28 @@ function execCommand(line) {
                 printLocation();
                 break;
             case "step":
+            case "s":
+                // Source-level: one C statement can span several instructions (e.g.
+                // a call site's argument setup + branch), so this can run several
+                // instructions before actually landing on the next line.
+                session.target.sourceStep.into();
+                printLocation();
+                break;
+            case "next":
+            case "n":
+            case "over":
+                session.target.sourceStep.over();
+                printLocation();
+                break;
+            case "stepi":
             case "si":
+                // asm-level: steps exactly one machine instruction - use this if
+                // `step` seems "stuck" and you want to see the individual
+                // instructions a source line compiles to.
                 session.target.asmStep.into();
                 printLocation();
                 break;
-            case "over":
-            case "next":
+            case "nexti":
                 session.target.asmStep.over();
                 printLocation();
                 break;
@@ -187,6 +224,12 @@ function execCommand(line) {
                 print("wrote " + hex(wval) + " to " + hex(waddr));
                 break;
             case "bt":
+                print(session.callStack.getStackTrace());
+                break;
+            case "frame":
+                // DSS has no per-frame register-context selection API for this
+                // target - the interface.py command parser for "frame" locates
+                // frame N by re-parsing the same trace format `bt` uses.
                 print(session.callStack.getStackTrace());
                 break;
             case "quit":

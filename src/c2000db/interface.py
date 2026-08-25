@@ -16,22 +16,31 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from io import BufferedReader
 from pathlib import Path
-from typing import Generator
+from typing import TYPE_CHECKING, Protocol
 
 from .ccxml import build_ccxml, load_ccxml_config
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 
 # Called with one output line (no trailing newline) at a time, in the order the
 # script printed them. A parser raising is caught and reported, not propagated.
 type LineParser = Callable[[str], None]
 
-# Called with an iterator over every output line belonging to one command's block
-# (no trailing newlines, the "dbg> <cmd>" line itself excluded). A parser raising
-# is caught and reported, not propagated.
-type CommandParser = Callable[[Iterable[str]], None]
+
+class CommandParser(Protocol):
+    """
+    Called with (a) whatever followed the command name on its "dbg> <cmd> ..." line
+    (empty string if nothing did) and (b) an iterator over that command's output
+    lines (no trailing newlines, the "dbg> <cmd>" line itself excluded). A parser
+    raising is caught and reported, not propagated.
+    """
+
+    def __call__(self, args: str, lines: Iterable[str]) -> None: ...
+
 
 # The REPL echoes every command it runs as its own "dbg> <cmd>" line - must match
 # repl.js's prompt string.
@@ -39,6 +48,35 @@ _PROMPT_PREFIX = "dbg> "
 
 # Must match repl.js's END_OF_COMMAND_MARKER.
 _END_OF_COMMAND_MARKER = "##--dbg-end--##"
+
+# repl.js commands that call printLocation() after moving the target - i.e. ones
+# whose output should trigger automatic source-line rendering.
+LOCATION_COMMANDS = frozenset(
+    {
+        "halt",
+        "run",
+        "go",
+        "continue",
+        "c",
+        "restart",
+        "step",
+        "s",
+        "next",
+        "n",
+        "over",
+        "stepi",
+        "si",
+        "nexti",
+    },
+)
+
+
+def is_location_command(name: str) -> bool:
+    """
+    Whether command `name` has incidence on where we are in the source code.
+    """
+    return name in LOCATION_COMMANDS
+
 
 DSS_BASENAME = "dss"
 JS_FOLDER_PATH = Path(__file__).parent / "js"
@@ -134,7 +172,7 @@ def check_dss_available(dss_location: Path | None = None) -> DSSInfo:
     dss_location = dss_location or get_dss_path_from_env()
     if not dss_location.exists():
         raise FileNotFoundError(
-            f"DSS location configured as {dss_location}, but file does not exist"
+            f"DSS location configured as {dss_location}, but file does not exist",
         )
     stdout, _ = invoke_dss(dss_location, str(get_script_by_name("get_info")))
     return parse_info(stdout)
@@ -195,7 +233,8 @@ def run_script(
 
 
 def _iter_output_lines(
-    stdout: BufferedReader, line_parsers: Sequence[LineParser]
+    stdout: BufferedReader,
+    line_parsers: Sequence[LineParser],
 ) -> Generator[str]:
     """
     Decodes `stdout` and yields each complete line the child printed, in order,
@@ -243,16 +282,17 @@ def gather_command_output(lines: Iterator[str]) -> Generator[str]:
         yield line
 
 
-def _echo_command_output(lines: Iterable[str]) -> None:
+def _echo_command_output(args: str, lines: Iterable[str]) -> None:
     """Default `CommandParser`: just prints each line, for commands with no registered parser."""
+    _ = args
     for line in lines:
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
 
 
-def _run_command_parser(parser: CommandParser, lines: Iterator[str]) -> None:
+def _run_command_parser(parser: CommandParser, args: str, lines: Iterator[str]) -> None:
     try:
-        parser(lines)
+        parser(args, lines)
     except Exception as exc:  # noqa: BLE001 - a broken parser must not kill the REPL
         print(f"[c2000db] command parser {parser!r} raised: {exc!r}", file=sys.stderr)  # noqa: T201
     finally:
@@ -284,9 +324,9 @@ def _pump_and_parse_stdout(
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
         if line.startswith(_PROMPT_PREFIX):
-            command_name = line.removeprefix(_PROMPT_PREFIX).split(maxsplit=1)
-            parser = command_parsers.get(command_name[0]) if command_name else None
-            _run_command_parser(parser or _echo_command_output, gather_command_output(lines))
+            command_name, _, args = line.removeprefix(_PROMPT_PREFIX).partition(" ")
+            parser = command_parsers.get(command_name, _echo_command_output)
+            _run_command_parser(parser, args, gather_command_output(lines))
 
 
 def run_reset(dss_location: Path | None = None, ccxml_path: Path | None = None) -> int:

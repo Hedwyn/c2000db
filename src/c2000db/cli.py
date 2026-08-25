@@ -18,8 +18,15 @@ from rich.console import Console
 from rich.table import Table
 
 from .ccxml import CCXMLConfig, DebugProbe, dump_ccxml_config
-from .interface import check_dss_available, generate_ccxml_from_device_config, run_repl, run_reset
-from .render import render_backtrace
+from .interface import (
+    LOCATION_COMMANDS,
+    check_dss_available,
+    generate_ccxml_from_device_config,
+    is_location_command,
+    run_repl,
+    run_reset,
+)
+from .render import render_backtrace, render_current_line, render_frame_source
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
@@ -122,7 +129,11 @@ def repl(ccxml: Path | None, device: Path | None, commands_path: Path | None) ->
             run_repl(
                 ccxml_path=generated_ccxml,
                 commands_path=commands_path,
-                command_parsers={"bt": render_backtrace},
+                command_parsers={
+                    "bt": render_backtrace,
+                    "frame": render_frame_source,
+                    **{name: render_current_line for name in LOCATION_COMMANDS if is_location_command(name)},
+                },
             ),
         )
 
