@@ -8,17 +8,37 @@ the DSS script for CCS studio
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from io import BufferedReader
 from pathlib import Path
 from typing import Generator
 
 from .ccxml import build_ccxml, load_ccxml_config
+
+# Called with one output line (no trailing newline) at a time, in the order the
+# script printed them. A parser raising is caught and reported, not propagated.
+type LineParser = Callable[[str], None]
+
+# Called with an iterator over every output line belonging to one command's block
+# (no trailing newlines, the "dbg> <cmd>" line itself excluded). A parser raising
+# is caught and reported, not propagated.
+type CommandParser = Callable[[Iterable[str]], None]
+
+# The REPL echoes every command it runs as its own "dbg> <cmd>" line - must match
+# repl.js's prompt string.
+_PROMPT_PREFIX = "dbg> "
+
+# Must match repl.js's END_OF_COMMAND_MARKER.
+_END_OF_COMMAND_MARKER = "##--dbg-end--##"
 
 DSS_BASENAME = "dss"
 JS_FOLDER_PATH = Path(__file__).parent / "js"
@@ -139,15 +159,12 @@ def generate_ccxml_from_device_config(config_path: Path) -> Generator[Path]:
         yield ccxml_path
 
 
-def run_script(
+def _build_dss_invocation(
     script: str,
     dss_location: Path | None,
-    ccxml_path: Path | None = None,
-    commands_path: Path | None = None,
-) -> int:
-    """
-    Main helper to run a script with dss
-    """
+    ccxml_path: Path | None,
+    commands_path: Path | None,
+) -> tuple[list[str], dict[str, str]]:
     dss_location = dss_location or get_dss_path_from_env()
     if not dss_location.exists():
         raise FileNotFoundError(
@@ -160,9 +177,116 @@ def run_script(
         env["DSS_CCXML"] = str(ccxml_path)
     if commands_path:
         env["DSS_COMMANDS"] = str(commands_path)
+    return command, env
 
+
+def run_script(
+    script: str,
+    dss_location: Path | None,
+    ccxml_path: Path | None = None,
+    commands_path: Path | None = None,
+) -> int:
+    """
+    Main helper to run a script with dss
+    """
+    command, env = _build_dss_invocation(script, dss_location, ccxml_path, commands_path)
     proc = subprocess.run(command, check=False, env=env)  # noqa: S603
     return proc.returncode
+
+
+def _iter_output_lines(
+    stdout: BufferedReader, line_parsers: Sequence[LineParser]
+) -> Generator[str]:
+    """
+    Decodes `stdout` and yields each complete line the child printed, in order,
+    calling every parser in `line_parsers` on it first (the end-of-command marker is
+    exempt - it's plumbing for `gather_command_output`, not real REPL output).
+
+    Also echoes the unterminated "dbg> " prompt the instant it shows up (it never
+    gets a trailing newline, since it's printed right before `stdin.readLine()`, so a
+    human needs to see it before typing) - this always falls between one command's
+    end-of-command marker and the next "dbg> <cmd>" line, i.e. never while a
+    `gather_command_output` call is mid-block, so it's safe to always echo live.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending = ""
+    while chunk := stdout.read1(2**16):
+        pending += decoder.decode(chunk)
+        while (newline_idx := pending.find("\n")) != -1:
+            line, pending = pending[:newline_idx], pending[newline_idx + 1 :]
+            line = line.rstrip("\r")
+            if line != _END_OF_COMMAND_MARKER:
+                for parser in line_parsers:
+                    try:
+                        parser(line)
+                    except Exception as exc:  # noqa: BLE001 - a broken parser must not kill the REPL
+                        print(f"[c2000db] line parser {parser!r} raised: {exc!r}", file=sys.stderr)  # noqa: T201
+            yield line
+        if pending == _PROMPT_PREFIX:
+            sys.stdout.write(pending)
+            sys.stdout.flush()
+            pending = ""
+    if pending:
+        yield pending.rstrip("\r")
+
+
+def gather_command_output(lines: Iterator[str]) -> Generator[str]:
+    """
+    Pulls lines from `lines` (as produced by `_iter_output_lines`) and yields them
+    one by one, stopping - without yielding it - at the end-of-command marker that
+    closes the current command's block. Meant to be called once per command, right
+    after its "dbg> <cmd>" line has been consumed from `lines`.
+    """
+    for line in lines:
+        if line == _END_OF_COMMAND_MARKER:
+            return
+        yield line
+
+
+def _echo_command_output(lines: Iterable[str]) -> None:
+    """Default `CommandParser`: just prints each line, for commands with no registered parser."""
+    for line in lines:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+
+def _run_command_parser(parser: CommandParser, lines: Iterator[str]) -> None:
+    try:
+        parser(lines)
+    except Exception as exc:  # noqa: BLE001 - a broken parser must not kill the REPL
+        print(f"[c2000db] command parser {parser!r} raised: {exc!r}", file=sys.stderr)  # noqa: T201
+    finally:
+        # Drain whatever the parser didn't consume, so `lines` (shared with the
+        # caller's line iterator) ends up positioned right after this command's
+        # end-of-command marker regardless of how much the parser actually read.
+        for _ in lines:
+            pass
+
+
+def _pump_and_parse_stdout(
+    stdout: BufferedReader,
+    line_parsers: Sequence[LineParser],
+    command_parsers: Mapping[str, CommandParser],
+) -> None:
+    """
+    Echoes `stdout` to this process's stdout as it arrives, while additionally:
+      * calling every parser in `line_parsers` on each complete line the child printed.
+      * for a command whose name is a key in `command_parsers`, handing that
+        command's output lines to the matching parser instead of printing them raw -
+        the "dbg> <cmd>" line itself is still echoed live, only the result lines are
+        replaced by whatever the parser renders.
+
+    `stdin` is left untouched by the caller, so a REPL child stays fully interactive
+    while its stdout is being observed.
+    """
+    lines = _iter_output_lines(stdout, line_parsers)
+    for line in lines:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+        if line.startswith(_PROMPT_PREFIX):
+            command_name = line.removeprefix(_PROMPT_PREFIX).split(maxsplit=1)
+            parser = command_parsers.get(command_name[0]) if command_name else None
+            _run_command_parser(parser or _echo_command_output, gather_command_output(lines))
 
 
 def run_reset(dss_location: Path | None = None, ccxml_path: Path | None = None) -> int:
@@ -176,17 +300,28 @@ def run_repl(
     dss_location: Path | None = None,
     ccxml_path: Path | None = None,
     commands_path: Path | None = None,
+    line_parsers: Iterable[LineParser] = (),
+    command_parsers: Mapping[str, CommandParser] | None = None,
 ) -> int:
     """
     Runs the interactive REPL script.
     If `commands_path` is given, its lines are run as debugger commands
     before dropping into the interactive prompt (like `gdb -x`).
+    If `line_parsers` is given, each is called with every line the REPL prints to
+    stdout (stdin stays interactive, stderr is untouched). Output is still echoed
+    to this process's stdout as it arrives.
+    If `command_parsers` is given, running a command whose name is a key in it (e.g.
+    "bt") hands that command's output lines to the matching parser instead of
+    printing them raw - typically used to render a command's output as a Rich table.
     Returns the exit code from the DSS process.
     """
+    parsers = list(line_parsers)
+    command, env = _build_dss_invocation("repl", dss_location, ccxml_path, commands_path)
+    if not parsers and not command_parsers:
+        proc = subprocess.run(command, check=False, env=env)  # noqa: S603
+        return proc.returncode
 
-    return run_script(
-        "repl",
-        dss_location=dss_location,
-        ccxml_path=ccxml_path,
-        commands_path=commands_path,
-    )
+    with subprocess.Popen(command, env=env, stdout=subprocess.PIPE) as repl_proc:  # noqa: S603
+        assert isinstance(repl_proc.stdout, BufferedReader), "stdout explicitly piped above"
+        _pump_and_parse_stdout(repl_proc.stdout, parsers, command_parsers or {})
+        return repl_proc.wait()

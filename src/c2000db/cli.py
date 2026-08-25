@@ -19,6 +19,7 @@ from rich.table import Table
 
 from .ccxml import CCXMLConfig, DebugProbe, dump_ccxml_config
 from .interface import check_dss_available, generate_ccxml_from_device_config, run_repl, run_reset
+from .render import render_backtrace
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
@@ -117,7 +118,13 @@ def info() -> None:
 )
 def repl(ccxml: Path | None, device: Path | None, commands_path: Path | None) -> None:
     with _use_ccxml(device, ccxml) as generated_ccxml:
-        sys.exit(run_repl(ccxml_path=generated_ccxml, commands_path=commands_path))
+        sys.exit(
+            run_repl(
+                ccxml_path=generated_ccxml,
+                commands_path=commands_path,
+                command_parsers={"bt": render_backtrace},
+            ),
+        )
 
 
 @c2000_debugger.command()

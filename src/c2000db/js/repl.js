@@ -22,6 +22,12 @@ if (!CCXML) {
 var DEFAULT_OUT = "build/fw-boot.out";
 var COMMANDS_PATH = java.lang.System.getenv("DSS_COMMANDS");
 
+// Printed as its own line right after every command's output, so a stdout-only
+// observer (see interface.py's _pump_and_parse_stdout) can tell exactly where one
+// command's output ends, without waiting for the next prompt to show up. Must match
+// interface.py's END_OF_COMMAND_MARKER.
+var END_OF_COMMAND_MARKER = "##--dbg-end--##";
+
 var env = ScriptingEnvironment.instance();
 env.traceSetConsoleLevel(TraceLevel.INFO);
 env.setScriptTimeout(60000);
@@ -62,9 +68,9 @@ function help() {
         "connect | disconnect",
         "load [out]                 - load symbols only, default " + DEFAULT_OUT,
         "flash [out]                - reprogram device + load symbols (session.memory.loadProgram)",
-        "halt | run | reset | restart",
+        "halt | run/go/continue/c | reset | restart",
         "fire                        - like run, but doesn't read PC/location back (for timing tests)",
-        "step | over                - single asm instruction step (into / over a call)",
+        "step/si | next/over        - single asm instruction step (into / over a call)",
         "break <symbol|0xADDR>      - set breakpoint, prints its id",
         "delete <id> | clearbp",
         "print <expr>                - evaluate a C expression / register (e.g. PC, ACC, a global)",
@@ -117,6 +123,8 @@ function execCommand(line) {
                 break;
             case "run":
             case "go":
+            case "continue":
+            case "c":
                 var runStart = java.lang.System.currentTimeMillis();
                 session.target.run();
                 var runElapsed = java.lang.System.currentTimeMillis() - runStart;
@@ -137,6 +145,7 @@ function execCommand(line) {
                 printLocation();
                 break;
             case "over":
+            case "next":
                 session.target.asmStep.over();
                 printLocation();
                 break;
@@ -207,7 +216,9 @@ function runCommandScript(path) {
                 continue;
             }
             print("dbg> " + trimmed);
-            if (!execCommand(trimmed)) {
+            var ok = execCommand(trimmed);
+            print(END_OF_COMMAND_MARKER);
+            if (!ok) {
                 return false;
             }
         }
@@ -231,7 +242,12 @@ while (keepGoing) {
     if (line === null) {
         break;
     }
+    // Echoed as its own "dbg> <line>" line (like runCommandScript does) so a
+    // stdout-only observer can always tell which command produced what output,
+    // whether it was typed interactively or came from a DSS_COMMANDS script.
+    print("dbg> " + line);
     keepGoing = execCommand(line);
+    print(END_OF_COMMAND_MARKER);
 }
 
 print("Disconnecting...");
