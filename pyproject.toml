@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "c2000db"
+version = "0.1.0"
+description = "C2000 debugger"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["click", "rich"]
+
+
+[project.scripts]
+"c2000db" = "c2000db.cli:c2000_debugger"
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/README.md"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/c2000db"]
