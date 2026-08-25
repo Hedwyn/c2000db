@@ -27,6 +27,12 @@ _BT_FRAME_RE = re.compile(
     r"\s+PC\s*=\s*(?P<pc>0x[0-9A-Fa-f]+)\s+FP\s*=\s*(?P<fp>0x[0-9A-Fa-f]+)\s*$",
 )
 
+# Matches one `mem` line, e.g.: 0x80007: 0xaa55
+_MEM_LINE_RE = re.compile(r"^(?P<addr>0x[0-9A-Fa-f]+):\s*(?P<value>0x[0-9A-Fa-f]+)\s*$")
+
+# Matches `print`/`p` output, e.g.: afpu = 3145778 (0x300032)
+_PRINT_RE = re.compile(r"^(?P<expr>.+) = (?P<dec>-?\d+) \((?P<hex>0x[0-9A-Fa-f]+)\)\s*$")
+
 
 @dataclass(frozen=True)
 class BacktraceFrame:
@@ -195,3 +201,54 @@ def render_current_line(
     current = next((frame for frame in frames if frame.index == 0), None)
     if current is not None:
         _render_frame_panel(current, console, context)
+
+
+def render_mem(args: str, lines: Iterable[str], console: Console | None = None) -> None:
+    """
+    `mem` command parser: renders the "<addr>: <value>" dump as a Rich table
+    (address / hex / decimal columns) instead of a raw list of lines.
+    """
+    console = console or Console()
+    table = Table(title="Memory", caption=f"mem {args}" if args else None)
+    table.add_column("Address", justify="right", style="cyan")
+    table.add_column("Hex", style="magenta")
+    table.add_column("Decimal", justify="right")
+
+    notes: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = _MEM_LINE_RE.match(stripped)
+        if match is None:
+            notes.append(stripped)
+            continue
+        table.add_row(match["addr"], match["value"], str(int(match["value"], 16)))
+
+    if table.row_count:
+        console.print(table)
+    for note in notes:
+        console.print(f"[yellow]{note}[/yellow]")
+
+
+def render_print(args: str, lines: Iterable[str], console: Console | None = None) -> None:
+    """
+    `print`/`p` command parser: re-styles "expr = value (hex)" into a compact,
+    colorized line instead of plain text. Lines that don't match that shape (e.g.
+    an evaluation error) are printed as-is.
+    """
+    _ = args  # the expression is already embedded in the output line itself
+    console = console or Console()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = _PRINT_RE.match(stripped)
+        if match is None:
+            console.print(stripped)
+            continue
+        console.print(
+            f"[bold cyan]{match['expr']}[/bold cyan] [dim]=[/dim] "
+            f"[bold green]{match['dec']}[/bold green] "
+            f"[dim]([/dim][yellow]{match['hex']}[/yellow][dim])[/dim]",
+        )

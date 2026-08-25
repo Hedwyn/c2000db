@@ -26,7 +26,13 @@ from .interface import (
     run_repl,
     run_reset,
 )
-from .render import render_backtrace, render_current_line, render_frame_source
+from .render import (
+    render_backtrace,
+    render_current_line,
+    render_frame_source,
+    render_mem,
+    render_print,
+)
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
@@ -132,6 +138,9 @@ def repl(ccxml: Path | None, device: Path | None, commands_path: Path | None) ->
                 command_parsers={
                     "bt": render_backtrace,
                     "frame": render_frame_source,
+                    "mem": render_mem,
+                    "print": render_print,
+                    "p": render_print,
                     **{name: render_current_line for name in LOCATION_COMMANDS if is_location_command(name)},
                 },
             ),
